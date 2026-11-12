@@ -1,3 +1,11 @@
+# Opt-in single-origin performance trial
+
+`ORIGIN_KEEPALIVE_DOMAINS` defaults to empty. Set a comma-separated list of mapped domains to use backend HTTP keep-alive and `http-reuse safe` for those domains only. Unmatched domains are ignored with a startup message; route removal remains safe. Other origins keep server-close. Clear the variable and deploy to roll back. No HTTP/2/retry policy changes; POST is never replayed by this feature. Reused upstream disconnects can still produce a disconnect/502 and the client must handle the error.
+
+`ORIGIN_ERROR_LOGS=true` enables only abnormal/error HAProxy logs: backend, status, termination, timing and upstream SSL error. No URI, credentials, headers or client IP. Defaults false. Per-origin counters are included in REN_METRICS.origins. Counters reset on deploy/reload; compare deltas for equal windows, not raw totals across instances. Stats `peak` is an aggregate of per-backend peaks, not a simultaneous global peak.
+
+Keep-alive improves repeated short HTTP/XHTTP requests when supported by the origin; upgraded WebSockets remain dedicated, so sustained tunnel throughput is not expected to improve merely from this setting.
+
 # Multiple independent domain mappings
 
 The Windows installer supports multiple X-UI origins in one Render service. `ORIGIN_ROUTES_JSON` is an authoritative JSON array of objects with exactly `domain`, `origin_ip`, `origin_sni`, `origin_port`. Set it as a Render environment variable, never commit live configuration. Example schema (replace the documentation address before use):

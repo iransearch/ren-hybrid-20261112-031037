@@ -23,9 +23,9 @@ import tempfile
 import time
 
 LOG = logging.getLogger('ren_control')
-BUILD = 'ren-hybrid-3-multi-origin'
+BUILD = 'ren-hybrid-4-origin-trial'
 ROOT = Path(__file__).resolve().parent
-ORIGIN_KEYS = {'ORIGIN_IP', 'ORIGIN_PORT', 'ORIGIN_SNI', 'ORIGIN_ENABLED', 'ORIGIN_ROUTES_JSON'}
+ORIGIN_KEYS = {'ORIGIN_IP', 'ORIGIN_PORT', 'ORIGIN_SNI', 'ORIGIN_ENABLED', 'ORIGIN_ROUTES_JSON', 'ORIGIN_KEEPALIVE_DOMAINS', 'ORIGIN_ERROR_LOGS'}
 HOSTNAME = re.compile(r'(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
 
 
@@ -84,11 +84,21 @@ def parse_routes(raw, allow_private=False):
     return tuple(routes)
 
 
+def parse_domain_list(raw):
+    if not isinstance(raw,str) or len(raw)>65536: raise ValueError('Invalid ORIGIN_KEEPALIVE_DOMAINS')
+    domains=tuple(sorted(set(item.strip().lower().rstrip('.') for item in raw.split(',') if item.strip())))
+    if len(domains)>100 or any(not HOSTNAME.fullmatch(item) for item in domains):
+        raise ValueError('ORIGIN_KEEPALIVE_DOMAINS needs comma-separated DNS hostnames')
+    return domains
+
+
 @dataclass(frozen=True)
 class Settings:
     origin_ip: str = ''
     origin_sni: str = ''
     routes: tuple = ()
+    keepalive_domains: tuple = ()
+    error_logs: bool = False
     origin_port: int = 443
     origin_enabled: bool = True
     port: int = 10000
@@ -126,6 +136,8 @@ def load_settings(env=None):
     ssl.create_default_context(cafile=str(ca))  # Reject missing/invalid trust roots before launch.
     result = Settings(
         str(address), host, routes=routes,
+        keepalive_domains=parse_domain_list(env.get('ORIGIN_KEEPALIVE_DOMAINS','')),
+        error_logs=boolean(env.get('ORIGIN_ERROR_LOGS','false'),'ORIGIN_ERROR_LOGS'),
         origin_port=443 if routes else number(env,'ORIGIN_PORT',443,integer=True),
         origin_enabled=True if routes else boolean(env.get('ORIGIN_ENABLED','true'),'ORIGIN_ENABLED'),
         port=number(env,'PORT',10000,integer=True),
@@ -183,6 +195,13 @@ def render_config(s: Settings, run_dir: Path, capacity: int):
     authority = s.origin_sni + (f':{s.origin_port}' if s.origin_port != 443 else '')
     server_limit = f' maxconn {s.max_concurrent} maxqueue 1' if s.max_concurrent else ''
     disabled = ' disabled' if not s.origin_enabled else ''
+    error_logging = ''
+    if s.error_logs:
+        error_logging = """    log global
+    option dontlog-normal
+    option log-separate-errors
+    log-format "REN_ORIGIN_ERROR backend=%b server=%s status=%ST termination=%tsc connect_ms=%Tc response_ms=%Tr total_ms=%Tt ssl_error=%[ssl_bc_err] ssl_detail=%{+Q}[ssl_bc_err_str]"
+"""
     config = f'''global
     master-worker
     log stdout format raw local0 warning
@@ -193,7 +212,7 @@ def render_config(s: Settings, run_dir: Path, capacity: int):
     ssl-default-server-options ssl-min-ver TLSv1.2
 
 defaults
-    mode http
+{error_logging}    mode http
     option http-server-close
     retries 0
     timeout connect {duration(s.connect_timeout)}
@@ -219,6 +238,10 @@ backend origin
     if not s.routes: return config
     prefix=config.split('frontend public\n',1)[0]
     routing=f"frontend public\n    bind 0.0.0.0:{s.port}\n"
+    if any(route.domain in s.keepalive_domains for route in s.routes):
+        # Server-close is enabled if either frontend or backend asks for it.
+        # Keep unselected backends inheriting server-close from defaults.
+        routing+='    no option http-server-close\n    option http-keep-alive\n' 
     routing+="    http-request return status 200 content-type application/json string '{\"status\":\"ok\"}' if { path -m str /_ren/health }\n"
     routing+='    http-request set-var(txn.ren_route_host) req.hdr(host),lower,field(1,:)\n'
     for route in s.routes:
@@ -235,8 +258,11 @@ backend origin
         name=f'origin_{index}'
         routing+=f'    use_backend {name} if {{ var(txn.ren_route_host) -m str {route.domain} }}\n'
         authority=route.origin_sni+(f':{route.origin_port}' if route.origin_port!=443 else '')
+        connection_policy = ''
+        if route.domain in s.keepalive_domains:
+            connection_policy = '    no option http-server-close\n    option http-keep-alive\n    http-reuse safe\n'
         backends.append(f"""backend {name}
-    http-request set-header Host {authority}
+{connection_policy}    http-request set-header Host {authority}
     http-request set-timeout server {duration(s.ws_handshake_timeout)} if {{ hdr(Upgrade) -i websocket }}
     server target {route.origin_ip}:{route.origin_port} ssl verify required ca-file {quoted(run_dir / 'origin-ca.pem')} sni str({route.origin_sni}) verifyhost {route.origin_sni} alpn http/1.1{server_limit}
 """)
@@ -323,12 +349,17 @@ def worker_processes(master_socket):
 def haproxy_stats(stats_socket, prefix=''):
     raw=runtime_command(stats_socket,prefix+'show stat')
     rows=list(csv.DictReader(io.StringIO(raw.removeprefix('# '))))
-    result={}
+    result={'backends':{}}
     for row in rows:
         if (row.get('pxname')=='origin' or row.get('pxname','').startswith('origin_')) and row.get('svname')=='BACKEND':
+            backend={}
             for source,target in [('scur','active'),('smax','peak'),('stot','accepted_total'),('bin','bytes_in_total'),('bout','bytes_out_total'),('econ','connect_errors_total'),('eresp','response_errors_total'),('qcur','queued'),('hrsp_5xx','origin_5xx_total')]:
                 value=row.get(source,'')
+                backend[target]=int(value) if value and value.isdigit() else None
                 result[target]=(result.get(target) or 0)+int(value) if value and value.isdigit() else result.get(target)
+            for source,target in [('connect','backend_connect_total'),('reuse','backend_reuse_total'),('ctime','avg_connect_ms')]:
+                value=row.get(source,'');backend[target]=int(value) if value.isdigit() else None
+            result['backends'][row['pxname']]=backend
         if row.get('pxname')=='public' and row.get('svname')=='FRONTEND':
             value=row.get('hrsp_5xx',''); result['frontend_5xx_total']=int(value) if value.isdigit() else None
     return result
@@ -372,6 +403,11 @@ class Controller:
         LOG.info('REN Hybrid online build=%s instance=%s python=%s max_concurrent=%s resource_capacity=%d fd_soft=%s fd_hard=%s threads=%d',
                  BUILD,os.getenv('RENDER_INSTANCE_ID') or socket.gethostname(),sys.version.split()[0],
                  self.settings.max_concurrent or 'unlimited',self.capacity,self.soft_fd,self.hard_fd,self.settings.threads)
+        mapped={route.domain for route in self.settings.routes}
+        LOG.info('REN_PERFORMANCE keepalive_domains=%s unmatched_domains=%s error_logs=%s',
+                 json.dumps(sorted(mapped.intersection(self.settings.keepalive_domains))),
+                 json.dumps(sorted(set(self.settings.keepalive_domains)-mapped)),self.settings.error_logs)
+
 
     def _confirm_reload(self):
         pending=self.pending_reload
@@ -443,7 +479,16 @@ class Controller:
                 'current_workers':len(current),'draining_workers':len(old),
                 'pending_reload':self.pending_reload is not None,'runtime_state_pending':self.runtime_dirty}
         sample.update(process_metrics(process_tree(os.getpid())))
-        sample.update(cgroup_metrics()); sample.update(haproxy_stats(self.stats_socket))
+        sample.update(cgroup_metrics())
+        stats=haproxy_stats(self.stats_socket); backends=stats.pop('backends',{})
+        sample.update(stats)
+        sample['origins']=[{'domain':route.domain,'backend':f'origin_{index}',
+                            'keepalive':route.domain in self.settings.keepalive_domains,
+                            **backends.get(f'origin_{index}',{})}
+                           for index,route in enumerate(self.settings.routes,1)]
+        if not self.settings.routes:
+            sample['origins']=[{'backend':'origin','keepalive':False,**backends.get('origin',{})}]
+
         # Old workers have their own counters. Query each via the master CLI.
         for pid in old:
             old_stats=haproxy_stats(self.master_socket,f'@!{pid} ')
